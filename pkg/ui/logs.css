@@ -32,7 +32,7 @@ body {
 }
 
 .logo {
-    width: 120px;
+    width: 350px;
     height: auto;
     margin-bottom: 0.5rem;
 }
@@ -46,7 +46,7 @@ body {
 }
 
 .title.error {
-    color: #991b1b;
+    color: #868686;
 }
 
 
