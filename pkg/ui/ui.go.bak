@@ -11,5 +11,5 @@ var LogsCSS string
 //go:embed logs.js
 var LogsJS string
 
-//go:embed UniMannheim-Symbol.png
+//go:embed Nebari-Symbol.png
 var LogoPNG []byte

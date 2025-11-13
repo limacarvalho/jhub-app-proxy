@@ -24,7 +24,6 @@ type OAuthMiddleware struct {
 	hubHost      string
 	hubPrefix    string
 	cookieName   string
-	headerName   string
 	callbackPath string // Custom callback path (e.g., "oauth_callback" or "_temp/jhub-app-proxy/oauth_callback")
 	logger       *logger.Logger
 }
@@ -60,21 +59,19 @@ func NewOAuthMiddlewareWithCallbackPath(log *logger.Logger, callbackPath string)
 	}
 
 	hubHost := os.Getenv("JUPYTERHUB_HOST")
-
-	// JUPYTERHUB_BASE_URL is the base URL of the deployment (e.g., "/" or "/jupyter/")
-	// NOT the Hub's base URL. JupyterHub strips "/hub" from the Hub's base_url
-	// when setting this env var. We need to append "hub/" to get the Hub's base path,
-	// just like JupyterHub's HubOAuth class does.
-	deploymentBase := os.Getenv("JUPYTERHUB_BASE_URL")
-	if deploymentBase == "" {
-		deploymentBase = "/"
+	hubPrefix := os.Getenv("JUPYTERHUB_BASE_URL")
+	if hubPrefix == "" {
+		hubPrefix = "/hub/"
 	}
-	if !strings.HasSuffix(deploymentBase, "/") {
-		deploymentBase += "/"
+	// CRITICAL: JUPYTERHUB_BASE_URL can be "/" for custom deployments
+	// but OAuth endpoints are ALWAYS at /hub/api/oauth2/...
+	// So we need to ensure the OAuth URL includes /hub/ even if base URL is /
+	if hubPrefix == "/" {
+		hubPrefix = "/hub/"
 	}
-
-	// Construct the Hub's base path by appending "hub/" to the deployment base
-	hubPrefix := deploymentBase + "hub/"
+	if !strings.HasSuffix(hubPrefix, "/") {
+		hubPrefix += "/"
+	}
 
 	return &OAuthMiddleware{
 		clientID:     clientID,
@@ -84,7 +81,6 @@ func NewOAuthMiddlewareWithCallbackPath(log *logger.Logger, callbackPath string)
 		hubHost:      hubHost,
 		hubPrefix:    hubPrefix,
 		cookieName:   clientID,
-		headerName:   "X-Jupyterhub-Api-Token",
 		callbackPath: callbackPath,
 		logger:       log.WithComponent("oauth"),
 	}, nil
@@ -100,80 +96,107 @@ func (m *OAuthMiddleware) Wrap(next http.Handler) http.Handler {
 			return
 		}
 
-		maybeProxy := func(token string) bool {
-			if token == "" {
-				return false
+		// Fast-path for WebSocket upgrades
+		// WebSocket upgrade requests need to be processed quickly to avoid blocking the handshake
+		// We skip the expensive token validation and just check that a valid token cookie exists
+		if isWebSocketUpgrade(r) {
+			cookie, err := r.Cookie(m.cookieName)
+			if err == nil && cookie.Value != "" {
+				// Token exists - trust it for WebSocket upgrades
+				// The initial page load already validated the token
+				m.logger.Debug("WebSocket upgrade request with valid token cookie", "path", r.URL.Path)
+				next.ServeHTTP(w, r)
+				return
 			}
-
-			user, err := m.getUser(token)
-			if err != nil {
-				return false
-			}
-
-			pr := new(http.Request)
-			*pr = *r
-
-			userData, _ := json.Marshal(user)
-			pr.Header.Set("X-Forwarded-User-Data", string(userData))
-
-			m.logger.Info("setting user data in headers",
-				"header", "X-Forwarded-User-Data",
-				"user_name", user.Name,
-				"user_admin", user.Admin,
-				"user_roles", user.Roles,
-				"user_groups", user.Groups,
-				"user_scopes", user.Scopes,
-				"user_data_json", string(userData))
-
-			next.ServeHTTP(w, pr)
-			return true
-		}
-
-		if maybeProxy(r.Header.Get(m.headerName)) {
+			// No token cookie - reject the WebSocket
+			m.logger.Warn("WebSocket upgrade request without valid token cookie", "path", r.URL.Path)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
+		// Fast-path for interim page API calls
+		// The interim page JavaScript polls /api/logs and /api/logs/stats to check app readiness
+		// If the user already authenticated to load the HTML page, we can trust subsequent API calls
+		// This avoids the expensive token validation on every poll (which happens every 1 second)
+		if strings.Contains(r.URL.Path, "/_temp/jhub-app-proxy/api/") {
+			cookie, err := r.Cookie(m.cookieName)
+			if err == nil && cookie.Value != "" {
+				// Cookie exists - trust it for interim page APIs
+				// The user already authenticated to load the interim page
+				m.logger.Debug("Interim page API call with valid cookie, allowing", "path", r.URL.Path)
+				next.ServeHTTP(w, r)
+				return
+			}
+			// No cookie - this shouldn't happen if the page loaded, but reject it
+			m.logger.Warn("Interim page API call without valid cookie", "path", r.URL.Path)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		// Regular HTTP requests - full validation
 		cookie, err := r.Cookie(m.cookieName)
-		if err == nil && maybeProxy(cookie.Value) {
-			return
+		if err == nil && cookie.Value != "" {
+			// Validate token (you could add caching here if needed)
+			m.logger.Debug("Validating token for request", "path", r.URL.Path, "method", r.Method)
+			if m.validateToken(cookie.Value) {
+				m.logger.Debug("Token valid, allowing request", "path", r.URL.Path)
+				next.ServeHTTP(w, r)
+				return
+			}
+			m.logger.Warn("Token validation failed, redirecting to OAuth", "path", r.URL.Path)
+		} else {
+			if err != nil {
+				m.logger.Debug("No token cookie found", "path", r.URL.Path, "error", err.Error())
+			} else {
+				m.logger.Debug("Empty token cookie", "path", r.URL.Path)
+			}
 		}
 
 		// No valid token, redirect to OAuth
+		m.logger.Info("Redirecting to OAuth login", "path", r.URL.Path)
 		m.redirectToLogin(w, r)
 	})
 }
 
-type User struct {
-	Name   string   `json:"name"`
-	Admin  bool     `json:"admin"`
-	Roles  []string `json:"roles"`
-	Groups []string `json:"groups"`
-	Scopes []string `json:"scopes"`
+// isWebSocketUpgrade checks if the request is a WebSocket upgrade request
+func isWebSocketUpgrade(r *http.Request) bool {
+	// Check for WebSocket upgrade headers
+	// RFC 6455 requires these headers for WebSocket handshake
+	upgrade := r.Header.Get("Upgrade")
+	connection := r.Header.Get("Connection")
+
+	// Connection header can contain multiple values (e.g., "keep-alive, Upgrade")
+	// so we check if "upgrade" is present in the connection header
+	hasUpgradeConnection := false
+	for _, v := range strings.Split(connection, ",") {
+		if strings.EqualFold(strings.TrimSpace(v), "upgrade") {
+			hasUpgradeConnection = true
+			break
+		}
+	}
+
+	return strings.EqualFold(upgrade, "websocket") && hasUpgradeConnection
 }
 
-func (m *OAuthMiddleware) getUser(token string) (*User, error) {
-	req, err := http.NewRequest("GET", m.apiURL+"/user", nil)
-	if err != nil {
-		return nil, err
-	}
+func (m *OAuthMiddleware) validateToken(token string) bool {
+	req, _ := http.NewRequest("GET", m.apiURL+"/user", nil)
 	req.Header.Set("Authorization", "token "+token)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, err
+		m.logger.Debug("Token validation failed - network error", "error", err.Error())
+		return false
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("request to %s returned status %d", req.URL.String(), resp.StatusCode)
+	isValid := resp.StatusCode == http.StatusOK
+	if !isValid {
+		m.logger.Debug("Token validation failed - invalid status", "status", resp.StatusCode)
+	} else {
+		m.logger.Debug("Token validation succeeded")
 	}
 
-	var u User
-	if err := json.NewDecoder(resp.Body).Decode(&u); err != nil {
-		return nil, err
-	}
-
-	return &u, nil
+	return isValid
 }
 
 func (m *OAuthMiddleware) redirectToLogin(w http.ResponseWriter, r *http.Request) {
@@ -209,8 +232,24 @@ func (m *OAuthMiddleware) redirectToLogin(w http.ResponseWriter, r *http.Request
 
 	// Build OAuth URL with custom callback path
 	redirectURI := m.baseURL + m.callbackPath
-	authURL := fmt.Sprintf("%s%sapi/oauth2/authorize?client_id=%s&redirect_uri=%s&response_type=code&state=%s",
-		m.hubHost, m.hubPrefix, url.QueryEscape(m.clientID), url.QueryEscape(redirectURI), url.QueryEscape(state))
+
+	// Construct the OAuth authorize URL
+	// If hubHost is set (e.g., "https://example.com"), use it as-is
+	// If hubHost is empty, use hubPrefix as a relative URL (e.g., "/hub/")
+	var authURL string
+	if m.hubHost != "" {
+		// Absolute URL: https://example.com/hub/api/oauth2/authorize?...
+		authURL = fmt.Sprintf("%s%sapi/oauth2/authorize?client_id=%s&redirect_uri=%s&response_type=code&state=%s",
+			m.hubHost, m.hubPrefix, url.QueryEscape(m.clientID), url.QueryEscape(redirectURI), url.QueryEscape(state))
+	} else {
+		// Relative URL: /hub/api/oauth2/authorize?...
+		// This ensures the browser resolves it from the root of the domain
+		authURL = fmt.Sprintf("%sapi/oauth2/authorize?client_id=%s&redirect_uri=%s&response_type=code&state=%s",
+			m.hubPrefix, url.QueryEscape(m.clientID), url.QueryEscape(redirectURI), url.QueryEscape(state))
+	}
+
+	// Log at INFO level so it's always visible for debugging
+	m.logger.Info("Redirecting to OAuth", "authURL", authURL, "redirectURI", redirectURI)
 
 	http.Redirect(w, r, authURL, http.StatusFound)
 }

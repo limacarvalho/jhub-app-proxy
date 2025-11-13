@@ -18,8 +18,8 @@ type Config struct {
 	Command     []string
 	DestPort    int
 	CondaEnv    string
-	WorkDir    string
-	KeepAlive  bool
+	WorkDir     string
+	ForceAlive  bool
 	StripPrefix bool // Strip service prefix before forwarding (default: true for most apps)
 
 	// Git
@@ -86,8 +86,12 @@ Framework-agnostic - works with any web application (Streamlit, Voila, Panel, et
 		"Conda environment to activate")
 	rootCmd.Flags().StringVar(&cfg.WorkDir, "workdir", "",
 		"Working directory for the process")
-	rootCmd.Flags().BoolVar(&cfg.KeepAlive, "keep-alive", false,
-		"Always report activity to prevent idle culling (default: false, report actual activity)")
+	rootCmd.Flags().BoolVar(&cfg.ForceAlive, "force-alive", true,
+		"Force keep-alive (prevent idle culling)")
+
+	// Legacy compatibility flag that sets force-alive to false
+	rootCmd.Flags().BoolVar(&cfg.ForceAlive, "no-force-alive", false,
+		"Disable force keep-alive (report only real activity)")
 
 	// Prefix handling (default: strip prefix like jhsingle-native-proxy)
 	rootCmd.Flags().BoolVar(&cfg.StripPrefix, "strip-prefix", true,

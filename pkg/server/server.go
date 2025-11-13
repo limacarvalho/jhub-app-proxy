@@ -11,7 +11,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nebari-dev/jhub-app-proxy/pkg/activity"
 	"github.com/nebari-dev/jhub-app-proxy/pkg/api"
 	"github.com/nebari-dev/jhub-app-proxy/pkg/auth"
 	"github.com/nebari-dev/jhub-app-proxy/pkg/config"
@@ -25,16 +24,15 @@ import (
 
 // Server represents the HTTP server and its components
 type Server struct {
-	httpServer      *http.Server
-	manager         *process.ManagerWithLogs
-	interimHandler  *interim.Handler
-	router          *router.Router
-	logger          *logger.Logger
-	config          *config.Config
-	proxyPort       int
-	subprocessPort  int
-	interimPath     string
-	activityTracker *activity.Tracker
+	httpServer     *http.Server
+	manager        *process.ManagerWithLogs
+	interimHandler *interim.Handler
+	router         *router.Router
+	logger         *logger.Logger
+	config         *config.Config
+	proxyPort      int
+	subprocessPort int
+	interimPath    string
 }
 
 // Config contains all dependencies needed to create a server
@@ -145,9 +143,6 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("failed to create proxy handler: %w", err)
 	}
 
-	// Create activity tracker for JupyterHub activity reporting
-	activityTracker := activity.NewTracker()
-
 	// Create main router
 	mainRouter := router.New(router.Config{
 		Logger:            log,
@@ -160,7 +155,6 @@ func New(cfg Config) (*Server, error) {
 		AppRootPath:       appRootPath,
 		SubprocessURL:     cfg.SubprocessURL,
 		OAuthCallbackPath: oauthCallbackPath, // Empty if OAuth disabled
-		ActivityTracker:   activityTracker,
 	})
 
 	// Create HTTP server
@@ -170,16 +164,15 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	return &Server{
-		httpServer:      httpServer,
-		manager:         cfg.Manager,
-		interimHandler:  interimHandler,
-		router:          mainRouter,
-		logger:          log,
-		config:          cfg.AppConfig,
-		proxyPort:       cfg.ProxyPort,
-		subprocessPort:  cfg.SubprocessPort,
-		interimPath:     interimBasePath,
-		activityTracker: activityTracker,
+		httpServer:     httpServer,
+		manager:        cfg.Manager,
+		interimHandler: interimHandler,
+		router:         mainRouter,
+		logger:         log,
+		config:         cfg.AppConfig,
+		proxyPort:      cfg.ProxyPort,
+		subprocessPort: cfg.SubprocessPort,
+		interimPath:    interimBasePath,
 	}, nil
 }
 
@@ -223,7 +216,7 @@ func (s *Server) StartSubprocess(ctx context.Context, cmd []string) {
 	s.interimHandler.MarkAppDeployed()
 
 	if s.config.AuthType == "oauth" {
-		if err := startActivityReporter(ctx, s.config, s.logger, s.activityTracker); err != nil {
+		if err := startActivityReporter(ctx, s.config, s.logger); err != nil {
 			s.logger.Warn("failed to start activity reporter (continuing anyway)", "error", err)
 		}
 	}
@@ -277,7 +270,7 @@ func GetServicePrefix(log *logger.Logger) string {
 }
 
 // startActivityReporter starts the JupyterHub activity reporter
-func startActivityReporter(ctx context.Context, cfg *config.Config, log *logger.Logger, activityTracker *activity.Tracker) error {
+func startActivityReporter(ctx context.Context, cfg *config.Config, log *logger.Logger) error {
 	hubClient, err := hub.NewClientFromEnv(log)
 	if err != nil {
 		return fmt.Errorf("failed to create hub client: %w", err)
@@ -288,11 +281,11 @@ func startActivityReporter(ctx context.Context, cfg *config.Config, log *logger.
 	}
 
 	interval := 5 * time.Minute
-	_ = hubClient.StartActivityReporter(ctx, interval, cfg.KeepAlive, activityTracker)
+	_ = hubClient.StartActivityReporter(ctx, interval, cfg.ForceAlive)
 
 	log.Info("activity reporter started",
 		"interval", interval,
-		"keep_alive", cfg.KeepAlive)
+		"force_alive", cfg.ForceAlive)
 
 	return nil
 }

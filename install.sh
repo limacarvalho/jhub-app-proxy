@@ -5,7 +5,7 @@ set -e
 # Downloads and installs the latest release from GitHub
 
 # Configuration
-REPO="nebari-dev/jhub-app-proxy"
+REPO="limacarvalho/jhub-app-proxy"
 BINARY_NAME="jhub-app-proxy"
 # Use /tmp if HOME is not writable (common in containers)
 if [ -w "${HOME}" ] && [ "${HOME}" != "/" ]; then
