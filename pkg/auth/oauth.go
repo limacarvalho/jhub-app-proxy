@@ -114,29 +114,22 @@ func (m *OAuthMiddleware) Wrap(next http.Handler) http.Handler {
 			return
 		}
 
-		// Fast-path for interim page API calls
-		// The interim page JavaScript polls /api/logs and /api/logs/stats to check app readiness
-		// If the user already authenticated to load the HTML page, we can trust subsequent API calls
-		// This avoids the expensive token validation on every poll (which happens every 1 second)
-		if strings.Contains(r.URL.Path, "/_temp/jhub-app-proxy/api/") {
-			cookie, err := r.Cookie(m.cookieName)
-			if err == nil && cookie.Value != "" {
+		// Regular HTTP requests - check for token first
+		cookie, err := r.Cookie(m.cookieName)
+		if err == nil && cookie.Value != "" {
+			// Fast-path for interim page API calls
+			// The interim page JavaScript polls /api/logs and /api/logs/stats to check app readiness
+			// If the user already authenticated to load the HTML page, we can trust subsequent API calls
+			// This avoids the expensive token validation on every poll (which happens every 1 second)
+			if strings.Contains(r.URL.Path, "/_temp/jhub-app-proxy/api/") {
 				// Cookie exists - trust it for interim page APIs
 				// The user already authenticated to load the interim page
 				m.logger.Debug("Interim page API call with valid cookie, allowing", "path", r.URL.Path)
 				next.ServeHTTP(w, r)
 				return
 			}
-			// No cookie - this shouldn't happen if the page loaded, but reject it
-			m.logger.Warn("Interim page API call without valid cookie", "path", r.URL.Path)
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
 
-		// Regular HTTP requests - full validation
-		cookie, err := r.Cookie(m.cookieName)
-		if err == nil && cookie.Value != "" {
-			// Validate token (you could add caching here if needed)
+			// Validate token for other requests (you could add caching here if needed)
 			m.logger.Debug("Validating token for request", "path", r.URL.Path, "method", r.Method)
 			if m.validateToken(cookie.Value) {
 				m.logger.Debug("Token valid, allowing request", "path", r.URL.Path)
@@ -314,10 +307,13 @@ func (m *OAuthMiddleware) handleCallback(w http.ResponseWriter, r *http.Request)
 	})
 
 	// Set token cookie
+	// CRITICAL: Use root path "/" to ensure cookie is accessible for interim page APIs
+	// The interim page JavaScript needs to access /_temp/jhub-app-proxy/api/* after authentication
+	// If we use m.baseURL (e.g., "/user/admin/app/"), cookie won't be sent to interim API paths
 	http.SetCookie(w, &http.Cookie{
 		Name:     m.cookieName,
 		Value:    tokenResp.AccessToken,
-		Path:     m.baseURL,
+		Path:     "/",
 		HttpOnly: true,
 		Secure:   r.TLS != nil,
 		SameSite: http.SameSiteLaxMode,
